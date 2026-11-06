@@ -1142,6 +1142,226 @@ var _ = Describe("LoadBalancer", func() {
 		})
 	})
 
+	Context("With reconciling loadbalancer labels and annotations", func() {
+
+		var (
+			c              *mockclient.MockClient
+			ctrl           *gomock.Controller
+			ctx            context.Context
+			lb             *loadbalancer
+			tenantService  *corev1.Service
+			desiredPorts   []corev1.ServicePort
+			loadBalancerIP string
+		)
+
+		const (
+			hostnameKey    = "external-dns.kubernetes.io/hostname"
+			alphaHostKey   = "external-dns.alpha.kubernetes.io/hostname"
+			hostnameVal    = "app.example.com"
+			newHostnameVal = "new.example.com"
+		)
+
+		expectGet := func(mirror *corev1.Service) {
+			c.EXPECT().Get(
+				ctx,
+				client.ObjectKey{Name: lbServiceName, Namespace: lbServiceNamespace},
+				gomock.AssignableToTypeOf(&corev1.Service{}),
+			).Do(func(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) {
+				mirror.DeepCopyInto(obj.(*corev1.Service))
+			})
+		}
+
+		BeforeEach(func() {
+			ctrl, ctx = gomock.WithContext(context.Background(), GinkgoT())
+			c = mockclient.NewMockClient(ctrl)
+			lb = &loadbalancer{
+				namespace: lbServiceNamespace,
+				client:    c,
+				config: LoadBalancerConfig{
+					CreationPollInterval: pointer.Int(1),
+					CreationPollTimeout:  pointer.Int(5),
+				},
+			}
+			tenantService = &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "service1",
+					Namespace:   "default",
+					UID:         types.UID("f6ebf172-2bb1-11e9-b210-d663bd873d93"),
+					Annotations: map[string]string{hostnameKey: hostnameVal},
+				},
+				Spec: corev1.ServiceSpec{
+					Type: corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{
+						{Name: "port1", Protocol: corev1.ProtocolTCP, Port: 80, NodePort: 30001},
+					},
+					ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+			}
+			desiredPorts = []corev1.ServicePort{
+				{Name: "port1", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 30001}},
+			}
+			loadBalancerIP = "123.456.7.8"
+		})
+
+		AfterEach(func() {
+			ctrl.Finish()
+		})
+
+		It("Should update annotations when an annotation value changed", func() {
+			oldTenant := tenantService.DeepCopy()
+			oldTenant.Annotations = map[string]string{hostnameKey: "old.example.com"}
+			mirror := generateInfraService(oldTenant, desiredPorts)
+			expectGet(mirror)
+
+			tenantService.Annotations = map[string]string{hostnameKey: newHostnameVal}
+			expected := generateInfraService(tenantService, desiredPorts)
+			c.EXPECT().Update(ctx, expected)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should remove the old annotation key when the key is renamed", func() {
+			oldTenant := tenantService.DeepCopy()
+			oldTenant.Annotations = map[string]string{alphaHostKey: hostnameVal}
+			mirror := generateInfraService(oldTenant, desiredPorts)
+			expectGet(mirror)
+
+			tenantService.Annotations = map[string]string{hostnameKey: hostnameVal}
+			expected := generateInfraService(tenantService, desiredPorts)
+			c.EXPECT().Update(ctx, expected)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should clear mirror annotations when the tenant annotations are removed", func() {
+			mirror := generateInfraService(tenantService, desiredPorts)
+			expectGet(mirror)
+
+			tenantService.Annotations = nil
+			expected := generateInfraService(tenantService, desiredPorts)
+			Expect(expected.Annotations).To(BeNil())
+			c.EXPECT().Update(ctx, expected)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should not call Update when tenant labels/annotations and ports are unchanged", func() {
+			mirror := generateInfraService(tenantService, desiredPorts)
+			mirror.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: loadBalancerIP}}
+			expectGet(mirror)
+
+			lbStatus, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(lbStatus.Ingress).To(HaveLen(1))
+			Expect(lbStatus.Ingress[0].IP).To(Equal(loadBalancerIP))
+		})
+
+		It("Should not call Update when both nil and empty annotations are present", func() {
+			tenantService.Annotations = nil
+			mirror := generateInfraService(tenantService, desiredPorts)
+			mirror.Annotations = map[string]string{}
+			expectGet(mirror)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should keep infraLabels overriding tenant-derived label values on update", func() {
+			lb.infraLabels = map[string]string{
+				TenantClusterNameLabelKey: "infra-cluster",
+				"example.com/infra":       "infra-value",
+			}
+			mirror := generateInfraService(tenantService, desiredPorts)
+			expectGet(mirror)
+
+			expected := generateInfraService(tenantService, desiredPorts)
+			expected.Labels[TenantClusterNameLabelKey] = "infra-cluster"
+			expected.Labels["example.com/infra"] = "infra-value"
+			c.EXPECT().Update(ctx, expected)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should preserve unmanaged labels on the mirror", func() {
+			changedPorts := []corev1.ServicePort{
+				{Name: "port1", Protocol: corev1.ProtocolTCP, Port: 80, TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: 30002}},
+			}
+			mirror := generateInfraService(tenantService, changedPorts)
+			mirror.Labels["example.com/manual"] = "keep"
+			expectGet(mirror)
+
+			expected := generateInfraService(tenantService, desiredPorts)
+			expected.Labels["example.com/manual"] = "keep"
+			c.EXPECT().Update(ctx, expected)
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("Should not alias the tenant annotation map from the updated mirror", func() {
+			oldTenant := tenantService.DeepCopy()
+			oldTenant.Annotations = map[string]string{hostnameKey: "old.example.com"}
+			mirror := generateInfraService(oldTenant, desiredPorts)
+			expectGet(mirror)
+
+			var updated *corev1.Service
+			c.EXPECT().Update(ctx, gomock.Any()).Do(func(_ context.Context, obj client.Object, _ ...client.UpdateOption) {
+				updated = obj.(*corev1.Service)
+			})
+
+			_, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(updated).NotTo(BeNil())
+
+			updated.Annotations["mutated"] = "yes"
+			Expect(tenantService.Annotations).NotTo(HaveKey("mutated"))
+			Expect(tenantService.Annotations).To(Equal(map[string]string{hostnameKey: hostnameVal}))
+		})
+
+		It("Should not alias the tenant annotation map from the created mirror", func() {
+			notFound := notFoundErr
+			c.EXPECT().Get(
+				ctx,
+				client.ObjectKey{Name: lbServiceName, Namespace: lbServiceNamespace},
+				gomock.AssignableToTypeOf(&corev1.Service{}),
+			).Return(notFound)
+
+			var created *corev1.Service
+			c.EXPECT().Create(ctx, gomock.Any()).Do(func(_ context.Context, obj client.Object, _ ...client.CreateOption) {
+				created = obj.(*corev1.Service)
+			})
+
+			ready := generateInfraService(tenantService, desiredPorts)
+			ready.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: loadBalancerIP}}
+			expectGet(ready)
+
+			lbStatus, err := lb.EnsureLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(lbStatus.Ingress).To(HaveLen(1))
+			Expect(created).NotTo(BeNil())
+
+			created.Annotations["mutated"] = "yes"
+			Expect(tenantService.Annotations).NotTo(HaveKey("mutated"))
+		})
+
+		It("Should update annotations through UpdateLoadBalancer", func() {
+			oldTenant := tenantService.DeepCopy()
+			oldTenant.Annotations = map[string]string{alphaHostKey: hostnameVal}
+			mirror := generateInfraService(oldTenant, desiredPorts)
+			expectGet(mirror)
+
+			expected := generateInfraService(tenantService, desiredPorts)
+			c.EXPECT().Update(ctx, expected)
+
+			err := lb.UpdateLoadBalancer(ctx, clusterName, tenantService, nil)
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+	})
+
 	Context("With ensuring loadbalancer is deleted", Ordered, func() {
 
 		var (

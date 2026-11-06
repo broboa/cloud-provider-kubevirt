@@ -74,9 +74,9 @@ func (lb *loadbalancer) EnsureLoadBalancer(ctx context.Context, clusterName stri
 	}
 
 	ports := lb.createLoadBalancerServicePorts(service)
-	// LoadBalancer already exist, update the ports if changed
+	// LoadBalancer already exist, reconcile ports, labels and annotations
 	if lbService != nil {
-		return &lbService.Status.LoadBalancer, lb.updateLoadBalancerServicePorts(ctx, lbService, ports)
+		return &lbService.Status.LoadBalancer, lb.updateLoadBalancerService(ctx, lbService, service, clusterName, ports)
 	}
 
 	vmiLabels := map[string]string{
@@ -84,15 +84,7 @@ func (lb *loadbalancer) EnsureLoadBalancer(ctx context.Context, clusterName stri
 		TenantClusterNameLabelKey: clusterName,
 	}
 
-	lbLabels := map[string]string{
-		TenantServiceNameLabelKey:      service.Name,
-		TenantServiceNamespaceLabelKey: service.Namespace,
-		TenantClusterNameLabelKey:      clusterName,
-	}
-
-	for key, val := range lb.infraLabels {
-		lbLabels[key] = val
-	}
+	lbLabels := lb.createLoadBalancerLabels(service, clusterName)
 
 	lbService, err = lb.createLoadBalancerService(ctx, lbName, service, vmiLabels, lbLabels, ports)
 	if err != nil {
@@ -124,7 +116,7 @@ func (lb *loadbalancer) EnsureLoadBalancer(ctx context.Context, clusterName stri
 	return &lbService.Status.LoadBalancer, nil
 }
 
-// UpdateLoadBalancer updates the ports in the LoadBalancer Service, if needed
+// UpdateLoadBalancer updates the ports, labels and annotations in the LoadBalancer Service, if needed
 // Implementations must treat the *v1.Service and *v1.Node
 // parameters as read-only and not modify them.
 // Parameter 'clusterName' is the name of the cluster as presented to kube-controller-manager
@@ -141,19 +133,82 @@ func (lb *loadbalancer) UpdateLoadBalancer(ctx context.Context, clusterName stri
 	}
 
 	ports := lb.createLoadBalancerServicePorts(service)
-	// LoadBalancer already exist, update the ports if changed
-	return lb.updateLoadBalancerServicePorts(ctx, &lbService, ports)
+	// LoadBalancer already exist, reconcile ports, labels and annotations
+	return lb.updateLoadBalancerService(ctx, &lbService, service, clusterName, ports)
 }
 
-func (lb *loadbalancer) updateLoadBalancerServicePorts(ctx context.Context, lbService *corev1.Service, ports []corev1.ServicePort) error {
+// updateLoadBalancerService reconciles the mirror Service with the tenant Service and issues
+// a single Update only if something changed.
+// Ports and managed labels are merged into the mirror. Annotations are replaced wholesale:
+// the mirror annotations are owned by this provider, and removals (e.g. a key rename) must propagate.
+func (lb *loadbalancer) updateLoadBalancerService(ctx context.Context, lbService *corev1.Service, service *corev1.Service, clusterName string, ports []corev1.ServicePort) error {
+	changed := false
+
 	if !equality.Semantic.DeepEqual(ports, lbService.Spec.Ports) {
 		lbService.Spec.Ports = ports
-		if err := lb.client.Update(ctx, lbService); err != nil {
-			klog.Errorf("Failed to update LoadBalancer service: %v", err)
-			return err
+		changed = true
+	}
+
+	for key, val := range lb.createLoadBalancerLabels(service, clusterName) {
+		if cur, ok := lbService.Labels[key]; ok && cur == val {
+			continue
 		}
+		if lbService.Labels == nil {
+			lbService.Labels = map[string]string{}
+		}
+		lbService.Labels[key] = val
+		changed = true
+	}
+
+	desiredAnnotations := copyTenantAnnotations(service)
+	if !stringMapsEqual(desiredAnnotations, lbService.Annotations) {
+		lbService.Annotations = desiredAnnotations
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+	if err := lb.client.Update(ctx, lbService); err != nil {
+		klog.Errorf("Failed to update LoadBalancer service: %v", err)
+		return err
 	}
 	return nil
+}
+
+// createLoadBalancerLabels returns the managed labels for the mirror Service.
+// infraLabels are applied last and override the tenant-derived values.
+func (lb *loadbalancer) createLoadBalancerLabels(service *corev1.Service, clusterName string) map[string]string {
+	lbLabels := map[string]string{
+		TenantServiceNameLabelKey:      service.Name,
+		TenantServiceNamespaceLabelKey: service.Namespace,
+		TenantClusterNameLabelKey:      clusterName,
+	}
+	for key, val := range lb.infraLabels {
+		lbLabels[key] = val
+	}
+	return lbLabels
+}
+
+// copyTenantAnnotations returns a copy of the tenant Service annotations, or nil if there are none.
+// The mirror must never share the map with the tenant Service.
+func copyTenantAnnotations(service *corev1.Service) map[string]string {
+	if len(service.Annotations) == 0 {
+		return nil
+	}
+	annotations := make(map[string]string, len(service.Annotations))
+	for key, val := range service.Annotations {
+		annotations[key] = val
+	}
+	return annotations
+}
+
+// stringMapsEqual treats nil and empty maps as equal.
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return equality.Semantic.DeepEqual(a, b)
 }
 
 // EnsureLoadBalancerDeleted deletes the specified load balancer if it
@@ -198,7 +253,7 @@ func (lb *loadbalancer) createLoadBalancerService(ctx context.Context, lbName st
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        lbName,
 			Namespace:   lb.namespace,
-			Annotations: service.Annotations,
+			Annotations: copyTenantAnnotations(service),
 			Labels:      lbLabels,
 		},
 		Spec: corev1.ServiceSpec{
